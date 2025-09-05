@@ -7,9 +7,12 @@
 (define-constant ERR_STILL_ACTIVE (err u104))
 (define-constant ERR_INVALID_TIMEOUT (err u105))
 (define-constant ERR_INVALID_AMOUNT (err u106))
+(define-constant ERR_INVALID_PERCENTAGES (err u107))
+(define-constant ERR_TOO_MANY_BENEFICIARIES (err u108))
 
 (define-constant MIN_TIMEOUT_BLOCKS u144)
 (define-constant MAX_TIMEOUT_BLOCKS u52560)
+(define-constant MAX_BENEFICIARIES u10)
 
 (define-map switches
     { owner: principal }
@@ -23,6 +26,11 @@
 )
 
 (define-map switch-exists { owner: principal } bool)
+
+(define-map multi-beneficiaries
+    { owner: principal, beneficiary: principal }
+    { percentage: uint }
+)
 
 (define-data-var total-switches uint u0)
 (define-data-var total-value-locked uint u0)
@@ -47,6 +55,36 @@
                 created-at: current-block
             }
         )
+        (map-set switch-exists { owner: sender } true)
+        (var-set total-switches (+ (var-get total-switches) u1))
+        (ok true)
+    )
+)
+
+(define-public (create-multi-switch (beneficiaries (list 10 { beneficiary: principal, percentage: uint })) (timeout-blocks uint))
+    (let (
+        (sender tx-sender)
+        (current-block stacks-block-height)
+        (total-percentage (fold validate-and-sum-percentages beneficiaries u0))
+    )
+        (asserts! (not (default-to false (map-get? switch-exists { owner: sender }))) ERR_ALREADY_EXISTS)
+        (asserts! (>= timeout-blocks MIN_TIMEOUT_BLOCKS) ERR_INVALID_TIMEOUT)
+        (asserts! (<= timeout-blocks MAX_TIMEOUT_BLOCKS) ERR_INVALID_TIMEOUT)
+        (asserts! (is-eq total-percentage u100) ERR_INVALID_PERCENTAGES)
+        (asserts! (> (len beneficiaries) u0) ERR_INVALID_PERCENTAGES)
+        (asserts! (<= (len beneficiaries) MAX_BENEFICIARIES) ERR_TOO_MANY_BENEFICIARIES)
+        
+        (map-set switches
+            { owner: sender }
+            {
+                beneficiary: (get beneficiary (unwrap! (element-at beneficiaries u0) ERR_INVALID_PERCENTAGES)),
+                balance: u0,
+                last-checkin: current-block,
+                timeout-blocks: timeout-blocks,
+                created-at: current-block
+            }
+        )
+        (fold store-beneficiary beneficiaries sender)
         (map-set switch-exists { owner: sender } true)
         (var-set total-switches (+ (var-get total-switches) u1))
         (ok true)
@@ -125,6 +163,44 @@
         (var-set total-switches (- (var-get total-switches) u1))
         (var-set total-value-locked (- (var-get total-value-locked) balance))
         (ok balance)
+    )
+)
+
+(define-public (claim-multi-inheritance (owner principal))
+    (let (
+        (sender tx-sender)
+        (switch-data (unwrap! (map-get? switches { owner: owner }) ERR_NOT_FOUND))
+        (balance (get balance switch-data))
+        (last-checkin (get last-checkin switch-data))
+        (timeout-blocks (get timeout-blocks switch-data))
+        (beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: owner, beneficiary: sender }) ERR_UNAUTHORIZED))
+        (percentage (get percentage beneficiary-data))
+        (inheritance-amount (/ (* balance percentage) u100))
+    )
+        (asserts! (>= stacks-block-height (+ last-checkin timeout-blocks)) ERR_STILL_ACTIVE)
+        (asserts! (> balance u0) ERR_INSUFFICIENT_BALANCE)
+        (asserts! (> inheritance-amount u0) ERR_INSUFFICIENT_BALANCE)
+        
+        (try! (as-contract (stx-transfer? inheritance-amount tx-sender sender)))
+        
+        (map-set switches
+            { owner: owner }
+            (merge switch-data { balance: (- balance inheritance-amount) })
+        )
+        (map-delete multi-beneficiaries { owner: owner, beneficiary: sender })
+        (var-set total-value-locked (- (var-get total-value-locked) inheritance-amount))
+        
+        (let ((remaining-balance (- balance inheritance-amount)))
+            (if (is-eq remaining-balance u0)
+                (begin
+                    (map-delete switches { owner: owner })
+                    (map-delete switch-exists { owner: owner })
+                    (var-set total-switches (- (var-get total-switches) u1))
+                    (ok inheritance-amount)
+                )
+                (ok inheritance-amount)
+            )
+        )
     )
 )
 
@@ -244,4 +320,44 @@
         switch-data (ok (get balance switch-data))
         ERR_NOT_FOUND
     )
+)
+
+(define-private (validate-and-sum-percentages (beneficiary-entry { beneficiary: principal, percentage: uint }) (current-sum uint))
+    (let (
+        (percentage (get percentage beneficiary-entry))
+        (beneficiary (get beneficiary beneficiary-entry))
+    )
+        (begin
+            (asserts! (> percentage u0) u999)
+            (asserts! (<= percentage u100) u999)
+            (+ current-sum percentage)
+        )
+    )
+)
+
+(define-private (store-beneficiary (beneficiary-entry { beneficiary: principal, percentage: uint }) (owner principal))
+    (let (
+        (beneficiary (get beneficiary beneficiary-entry))
+        (percentage (get percentage beneficiary-entry))
+    )
+        (begin
+            (asserts! (not (is-eq owner beneficiary)) owner)
+            (map-set multi-beneficiaries
+                { owner: owner, beneficiary: beneficiary }
+                { percentage: percentage }
+            )
+            owner
+        )
+    )
+)
+
+(define-read-only (get-beneficiary-percentage (owner principal) (beneficiary principal))
+    (match (map-get? multi-beneficiaries { owner: owner, beneficiary: beneficiary })
+        beneficiary-data (ok (get percentage beneficiary-data))
+        ERR_NOT_FOUND
+    )
+)
+
+(define-read-only (has-multi-beneficiaries (owner principal) (test-beneficiary principal))
+    (is-some (map-get? multi-beneficiaries { owner: owner, beneficiary: test-beneficiary }))
 )
