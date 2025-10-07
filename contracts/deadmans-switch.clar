@@ -9,10 +9,14 @@
 (define-constant ERR_INVALID_AMOUNT (err u106))
 (define-constant ERR_INVALID_PERCENTAGES (err u107))
 (define-constant ERR_TOO_MANY_BENEFICIARIES (err u108))
+(define-constant ERR_GRACE_PERIOD_ACTIVE (err u109))
+(define-constant ERR_INVALID_GRACE_PERIOD (err u110))
 
 (define-constant MIN_TIMEOUT_BLOCKS u144)
 (define-constant MAX_TIMEOUT_BLOCKS u52560)
 (define-constant MAX_BENEFICIARIES u10)
+(define-constant MAX_GRACE_PERIOD_BLOCKS u4320)
+(define-constant DEFAULT_GRACE_PERIOD_BLOCKS u1008)
 
 (define-map switches
     { owner: principal }
@@ -21,7 +25,8 @@
         balance: uint,
         last-checkin: uint,
         timeout-blocks: uint,
-        created-at: uint
+        created-at: uint,
+        grace-period-blocks: uint
     }
 )
 
@@ -52,7 +57,8 @@
                 balance: u0,
                 last-checkin: current-block,
                 timeout-blocks: timeout-blocks,
-                created-at: current-block
+                created-at: current-block,
+                grace-period-blocks: DEFAULT_GRACE_PERIOD_BLOCKS
             }
         )
         (map-set switch-exists { owner: sender } true)
@@ -81,7 +87,8 @@
                 balance: u0,
                 last-checkin: current-block,
                 timeout-blocks: timeout-blocks,
-                created-at: current-block
+                created-at: current-block,
+                grace-period-blocks: DEFAULT_GRACE_PERIOD_BLOCKS
             }
         )
         (fold store-beneficiary beneficiaries sender)
@@ -151,9 +158,13 @@
         (balance (get balance switch-data))
         (last-checkin (get last-checkin switch-data))
         (timeout-blocks (get timeout-blocks switch-data))
+        (grace-period-blocks (get grace-period-blocks switch-data))
+        (expiry-block (+ last-checkin timeout-blocks))
+        (grace-end-block (+ expiry-block grace-period-blocks))
     )
         (asserts! (is-eq sender beneficiary) ERR_UNAUTHORIZED)
-        (asserts! (>= stacks-block-height (+ last-checkin timeout-blocks)) ERR_STILL_ACTIVE)
+        (asserts! (>= stacks-block-height expiry-block) ERR_STILL_ACTIVE)
+        (asserts! (>= stacks-block-height grace-end-block) ERR_GRACE_PERIOD_ACTIVE)
         (asserts! (> balance u0) ERR_INSUFFICIENT_BALANCE)
         
         (try! (as-contract (stx-transfer? balance tx-sender beneficiary)))
@@ -173,11 +184,15 @@
         (balance (get balance switch-data))
         (last-checkin (get last-checkin switch-data))
         (timeout-blocks (get timeout-blocks switch-data))
+        (grace-period-blocks (get grace-period-blocks switch-data))
+        (expiry-block (+ last-checkin timeout-blocks))
+        (grace-end-block (+ expiry-block grace-period-blocks))
         (beneficiary-data (unwrap! (map-get? multi-beneficiaries { owner: owner, beneficiary: sender }) ERR_UNAUTHORIZED))
         (percentage (get percentage beneficiary-data))
         (inheritance-amount (/ (* balance percentage) u100))
     )
-        (asserts! (>= stacks-block-height (+ last-checkin timeout-blocks)) ERR_STILL_ACTIVE)
+        (asserts! (>= stacks-block-height expiry-block) ERR_STILL_ACTIVE)
+        (asserts! (>= stacks-block-height grace-end-block) ERR_GRACE_PERIOD_ACTIVE)
         (asserts! (> balance u0) ERR_INSUFFICIENT_BALANCE)
         (asserts! (> inheritance-amount u0) ERR_INSUFFICIENT_BALANCE)
         
@@ -238,6 +253,42 @@
     )
 )
 
+(define-public (update-grace-period (new-grace-period-blocks uint))
+    (let (
+        (sender tx-sender)
+        (switch-data (unwrap! (map-get? switches { owner: sender }) ERR_NOT_FOUND))
+    )
+        (asserts! (<= new-grace-period-blocks MAX_GRACE_PERIOD_BLOCKS) ERR_INVALID_GRACE_PERIOD)
+        
+        (map-set switches
+            { owner: sender }
+            (merge switch-data { grace-period-blocks: new-grace-period-blocks })
+        )
+        (ok true)
+    )
+)
+
+(define-public (grace-period-rescue-checkin)
+    (let (
+        (sender tx-sender)
+        (switch-data (unwrap! (map-get? switches { owner: sender }) ERR_NOT_FOUND))
+        (last-checkin (get last-checkin switch-data))
+        (timeout-blocks (get timeout-blocks switch-data))
+        (grace-period-blocks (get grace-period-blocks switch-data))
+        (expiry-block (+ last-checkin timeout-blocks))
+        (grace-end-block (+ expiry-block grace-period-blocks))
+    )
+        (asserts! (>= stacks-block-height expiry-block) ERR_STILL_ACTIVE)
+        (asserts! (< stacks-block-height grace-end-block) ERR_GRACE_PERIOD_ACTIVE)
+        
+        (map-set switches
+            { owner: sender }
+            (merge switch-data { last-checkin: stacks-block-height })
+        )
+        (ok true)
+    )
+)
+
 (define-public (emergency-withdraw)
     (let (
         (sender tx-sender)
@@ -266,7 +317,11 @@
         (let (
             (last-checkin (get last-checkin switch-data))
             (timeout-blocks (get timeout-blocks switch-data))
+            (grace-period-blocks (get grace-period-blocks switch-data))
             (blocks-since-checkin (- stacks-block-height last-checkin))
+            (expiry-block (+ last-checkin timeout-blocks))
+            (grace-end-block (+ expiry-block grace-period-blocks))
+            (in-grace-period (and (>= stacks-block-height expiry-block) (< stacks-block-height grace-end-block)))
         )
             (ok {
                 active: (< blocks-since-checkin timeout-blocks),
@@ -275,7 +330,13 @@
                     none
                 ),
                 blocks-since-checkin: blocks-since-checkin,
-                can-claim: (>= blocks-since-checkin timeout-blocks)
+                can-claim: (>= stacks-block-height grace-end-block),
+                in-grace-period: in-grace-period,
+                blocks-until-grace-end: (if in-grace-period
+                    (some (- grace-end-block stacks-block-height))
+                    none
+                ),
+                grace-period-blocks: grace-period-blocks
             })
         )
         ERR_NOT_FOUND
@@ -288,8 +349,11 @@
         (let (
             (last-checkin (get last-checkin switch-data))
             (timeout-blocks (get timeout-blocks switch-data))
+            (grace-period-blocks (get grace-period-blocks switch-data))
+            (expiry-block (+ last-checkin timeout-blocks))
+            (grace-end-block (+ expiry-block grace-period-blocks))
         )
-            (ok (>= stacks-block-height (+ last-checkin timeout-blocks)))
+            (ok (>= stacks-block-height grace-end-block))
         )
         ERR_NOT_FOUND
     )
@@ -300,7 +364,9 @@
         total-switches: (var-get total-switches),
         total-value-locked: (var-get total-value-locked),
         min-timeout-blocks: MIN_TIMEOUT_BLOCKS,
-        max-timeout-blocks: MAX_TIMEOUT_BLOCKS
+        max-timeout-blocks: MAX_TIMEOUT_BLOCKS,
+        default-grace-period-blocks: DEFAULT_GRACE_PERIOD_BLOCKS,
+        max-grace-period-blocks: MAX_GRACE_PERIOD_BLOCKS
     })
 )
 
