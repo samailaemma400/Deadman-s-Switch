@@ -37,6 +37,11 @@
     { percentage: uint }
 )
 
+(define-map keepers
+    { owner: principal, keeper: principal }
+    bool
+)
+
 (define-data-var total-switches uint u0)
 (define-data-var total-value-locked uint u0)
 
@@ -266,6 +271,46 @@
         )
         (ok true)
     )
+)
+
+(define-public (grant-keeper (keeper principal))
+    (let (
+        (sender tx-sender)
+        (switch-data (unwrap! (map-get? switches { owner: sender }) ERR_NOT_FOUND))
+    )
+        (asserts! (not (is-eq sender keeper)) ERR_UNAUTHORIZED)
+        (map-set keepers { owner: sender, keeper: keeper } true)
+        (ok true)
+    )
+)
+
+(define-public (revoke-keeper (keeper principal))
+    (let (
+        (sender tx-sender)
+        (switch-data (unwrap! (map-get? switches { owner: sender }) ERR_NOT_FOUND))
+    )
+        (map-delete keepers { owner: sender, keeper: keeper })
+        (ok true)
+    )
+)
+
+(define-public (keeper-checkin (owner principal))
+    (let (
+        (sender tx-sender)
+        (is-allowed (default-to false (map-get? keepers { owner: owner, keeper: sender })))
+        (switch-data (unwrap! (map-get? switches { owner: owner }) ERR_NOT_FOUND))
+    )
+        (asserts! is-allowed ERR_UNAUTHORIZED)
+        (map-set switches
+            { owner: owner }
+            (merge switch-data { last-checkin: stacks-block-height })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (is-keeper (owner principal) (keeper principal))
+    (default-to false (map-get? keepers { owner: owner, keeper: keeper }))
 )
 
 (define-public (grace-period-rescue-checkin)
