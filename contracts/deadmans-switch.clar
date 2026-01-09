@@ -42,6 +42,11 @@
     bool
 )
 
+(define-map keeper-rewards
+    { owner: principal }
+    uint
+)
+
 (define-data-var total-switches uint u0)
 (define-data-var total-value-locked uint u0)
 
@@ -299,18 +304,47 @@
         (sender tx-sender)
         (is-allowed (default-to false (map-get? keepers { owner: owner, keeper: sender })))
         (switch-data (unwrap! (map-get? switches { owner: owner }) ERR_NOT_FOUND))
+        (balance (get balance switch-data))
+        (reward (default-to u0 (map-get? keeper-rewards { owner: owner })))
     )
         (asserts! is-allowed ERR_UNAUTHORIZED)
-        (map-set switches
-            { owner: owner }
-            (merge switch-data { last-checkin: stacks-block-height })
+        (if (and (> reward u0) (>= balance reward))
+            (begin
+                (try! (as-contract (stx-transfer? reward tx-sender sender)))
+                (map-set switches
+                    { owner: owner }
+                    (merge switch-data { balance: (- balance reward), last-checkin: stacks-block-height })
+                )
+                (var-set total-value-locked (- (var-get total-value-locked) reward))
+                (ok true)
+            )
+            (begin
+                (map-set switches
+                    { owner: owner }
+                    (merge switch-data { last-checkin: stacks-block-height })
+                )
+                (ok true)
+            )
         )
-        (ok true)
     )
 )
 
 (define-read-only (is-keeper (owner principal) (keeper principal))
     (default-to false (map-get? keepers { owner: owner, keeper: keeper }))
+)
+
+(define-public (set-keeper-reward (reward uint))
+    (let (
+        (sender tx-sender)
+        (switch-data (unwrap! (map-get? switches { owner: sender }) ERR_NOT_FOUND))
+    )
+        (map-set keeper-rewards { owner: sender } reward)
+        (ok true)
+    )
+)
+
+(define-read-only (get-keeper-reward (owner principal))
+    (default-to u0 (map-get? keeper-rewards { owner: owner }))
 )
 
 (define-public (grace-period-rescue-checkin)
