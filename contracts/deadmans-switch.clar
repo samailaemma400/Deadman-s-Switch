@@ -11,6 +11,9 @@
 (define-constant ERR_TOO_MANY_BENEFICIARIES (err u108))
 (define-constant ERR_GRACE_PERIOD_ACTIVE (err u109))
 (define-constant ERR_INVALID_GRACE_PERIOD (err u110))
+(define-constant ERR_BACKUP_NOT_FOUND (err u111))
+(define-constant ERR_BACKUP_NOT_READY (err u112))
+(define-constant ERR_INVALID_DELAY (err u113))
 
 (define-constant MIN_TIMEOUT_BLOCKS u144)
 (define-constant MAX_TIMEOUT_BLOCKS u52560)
@@ -45,6 +48,11 @@
 (define-map keeper-rewards
     { owner: principal }
     uint
+)
+
+(define-map backup-beneficiaries
+    { owner: principal }
+    { beneficiary: principal, delay-blocks: uint }
 )
 
 (define-data-var total-switches uint u0)
@@ -386,6 +394,49 @@
     )
 )
 
+(define-public (set-backup-beneficiary (beneficiary principal) (delay-blocks uint))
+    (let ((sender tx-sender))
+        (asserts! (switch-exists-check sender) ERR_NOT_FOUND)
+        (asserts! (not (is-eq sender beneficiary)) ERR_UNAUTHORIZED)
+        (asserts! (> delay-blocks u0) ERR_INVALID_DELAY)
+        (map-set backup-beneficiaries
+            { owner: sender }
+            { beneficiary: beneficiary, delay-blocks: delay-blocks }
+        )
+        (ok true)
+    )
+)
+
+(define-public (claim-backup-inheritance (owner principal))
+    (let (
+        (sender tx-sender)
+        (switch-data (unwrap! (map-get? switches { owner: owner }) ERR_NOT_FOUND))
+        (backup-data (unwrap! (map-get? backup-beneficiaries { owner: owner }) ERR_BACKUP_NOT_FOUND))
+        (backup-beneficiary (get beneficiary backup-data))
+        (delay-blocks (get delay-blocks backup-data))
+        (balance (get balance switch-data))
+        (last-checkin (get last-checkin switch-data))
+        (timeout-blocks (get timeout-blocks switch-data))
+        (grace-period-blocks (get grace-period-blocks switch-data))
+        (expiry-block (+ last-checkin timeout-blocks))
+        (grace-end-block (+ expiry-block grace-period-blocks))
+        (backup-unlock-block (+ grace-end-block delay-blocks))
+    )
+        (asserts! (is-eq sender backup-beneficiary) ERR_UNAUTHORIZED)
+        (asserts! (>= stacks-block-height backup-unlock-block) ERR_BACKUP_NOT_READY)
+        (asserts! (> balance u0) ERR_INSUFFICIENT_BALANCE)
+        
+        (try! (as-contract (stx-transfer? balance tx-sender backup-beneficiary)))
+        
+        (map-delete switches { owner: owner })
+        (map-delete switch-exists { owner: owner })
+        (map-delete backup-beneficiaries { owner: owner })
+        (var-set total-switches (- (var-get total-switches) u1))
+        (var-set total-value-locked (- (var-get total-value-locked) balance))
+        (ok balance)
+    )
+)
+
 (define-read-only (get-switch (owner principal))
     (map-get? switches { owner: owner })
 )
@@ -505,4 +556,8 @@
 
 (define-read-only (has-multi-beneficiaries (owner principal) (test-beneficiary principal))
     (is-some (map-get? multi-beneficiaries { owner: owner, beneficiary: test-beneficiary }))
+)
+
+(define-read-only (get-backup-beneficiary (owner principal))
+    (map-get? backup-beneficiaries { owner: owner })
 )
